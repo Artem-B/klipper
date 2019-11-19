@@ -5,6 +5,7 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import logging
 import pins, homing, manual_probe
+import subprocess
 
 HINT_TIMEOUT = """
 Make sure to home the printer before probing. If the probe
@@ -23,10 +24,15 @@ class PrinterProbe:
         self.x_offset = config.getfloat('x_offset', 0.)
         self.y_offset = config.getfloat('y_offset', 0.)
         self.z_offset = config.getfloat('z_offset')
+        self.measurement_script = config.get('measurement_script', None)
+        self.measurement_z = config.getfloat('measurement_z')
         self.probe_calibrate_z = 0.
         self.multi_probe_pending = False
         # Infer Z position to move to during a probe
-        if config.has_section('stepper_z'):
+        if self.measurement_script and self.measurement_z:
+            # Use configured position for script measurements.
+            self.z_position = self.measurement_z
+        elif config.has_section('stepper_z'):
             zconfig = config.getsection('stepper_z')
             self.z_position = zconfig.getfloat('position_min', 0.)
         else:
@@ -105,33 +111,48 @@ class PrinterProbe:
         return self.lift_speed
     def get_offsets(self):
         return self.x_offset, self.y_offset, self.z_offset
-    def _probe(self, speed):
+    def _run_external_measurement(self):
+        try:
+            value = float(subprocess.check_output(self.measurement_script, shell=True))
+        except:
+            raise self.gcode.error("Failed to read measurement value.")
+        return value
+    def _probe(self, speed, sample_retract_dist):
         toolhead = self.printer.lookup_object('toolhead')
         homing_state = homing.Homing(self.printer)
         pos = toolhead.get_position()
-        pos[2] = self.z_position
-        endstops = [(self.mcu_probe, "probe")]
-        verify = self.printer.get_start_args().get('debugoutput') is None
-        try:
-            homing_state.homing_move(pos, endstops, speed,
-                                     probe_pos=True, verify_movement=verify)
-        except homing.CommandError as e:
-            reason = str(e)
-            if "Timeout during endstop homing" in reason:
-                reason += HINT_TIMEOUT
-            raise homing.CommandError(reason)
-        pos = toolhead.get_position()
+        if self.measurement_script:
+            liftpos = self._get_liftpos(pos, sample_retract_dist)
+            self._move(liftpos, speed)
+            liftpos[2] = self.measurement_z
+            self._move(liftpos, speed, wait=True)
+            pos[2] = self._run_external_measurement()
+        else:
+            pos[2] = self.z_position
+            endstops = [(self.mcu_probe, "probe")]
+            verify = self.printer.get_start_args().get('debugoutput') is None
+            try:
+                homing_state.homing_move(pos, endstops, speed,
+                                        probe_pos=True, verify_movement=verify)
+            except homing.CommandError as e:
+                reason = str(e)
+                if "Timeout during endstop homing" in reason:
+                    reason += HINT_TIMEOUT
+                raise homing.CommandError(reason)
+            pos = toolhead.get_position()
         self.gcode.respond_info("probe at %.3f,%.3f is z=%.6f" % (
             pos[0], pos[1], pos[2]))
         self.gcode.reset_last_position()
         return pos[:3]
-    def _move(self, coord, speed):
+    def _move(self, coord, speed, wait=False):
         toolhead = self.printer.lookup_object('toolhead')
         curpos = toolhead.get_position()
         for i in range(len(coord)):
             if coord[i] is not None:
                 curpos[i] = coord[i]
         toolhead.move(curpos, speed)
+        if wait:
+            toolhead.wait_moves()
         self.gcode.reset_last_position()
     def _calc_mean(self, positions):
         count = float(len(positions))
@@ -145,6 +166,14 @@ class PrinterProbe:
             return z_sorted[middle]
         # even number of samples
         return self._calc_mean(z_sorted[middle-1:middle+1])
+    def _get_liftpos(self, pos, sample_retract_dist):
+        if self.measurement_script:
+            current_z = self.measurement_z
+        else:
+            current_z = pos[2]
+        liftpos = [None, None, current_z + sample_retract_dist]
+        return liftpos
+
     def run_probe(self, params={}):
         speed = self.gcode.get_float(
             "PROBE_SPEED", params, self.speed, above=0.)
@@ -166,7 +195,7 @@ class PrinterProbe:
         positions = []
         while len(positions) < sample_count:
             # Probe position
-            pos = self._probe(speed)
+            pos = self._probe(speed, sample_retract_dist)
             positions.append(pos)
             # Check samples tolerance
             z_positions = [p[2] for p in positions]
@@ -180,7 +209,7 @@ class PrinterProbe:
                 positions = []
             # Retract
             if len(positions) < sample_count:
-                liftpos = [None, None, pos[2] + sample_retract_dist]
+                liftpos = self._get_liftpos(pos, sample_retract_dist)
                 self._move(liftpos, lift_speed)
         if must_notify_multi_probe:
             self.multi_probe_end()
@@ -195,6 +224,10 @@ class PrinterProbe:
     cmd_QUERY_PROBE_help = "Return the status of the z-probe"
     def cmd_QUERY_PROBE(self, params):
         toolhead = self.printer.lookup_object('toolhead')
+        if self.measurement_script:
+            self.gcode.respond_info(
+                "probe: measured value %f" % self._run_external_measurement())
+            return
         print_time = toolhead.get_last_move_time()
         res = self.mcu_probe.query_endstop(print_time)
         self.gcode.respond_info(
@@ -220,10 +253,10 @@ class PrinterProbe:
         positions = []
         while len(positions) < sample_count:
             # Probe position
-            pos = self._probe(speed)
+            pos = self._probe(speed, sample_retract_dist)
             positions.append(pos)
             # Retract
-            liftpos = [None, None, pos[2] + sample_retract_dist]
+            liftpos = self._get_liftpos(pos, sample_retract_dist)
             self._move(liftpos, lift_speed)
         self.multi_probe_end()
         # Calculate maximum, minimum and average values
